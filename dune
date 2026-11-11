@@ -1,0 +1,25 @@
+(library
+ (name spec)
+ (modules spec)
+ (libraries unix))
+
+(executable
+ (name pp_cron)
+ (modules pp_cron)
+ (libraries spec unix))
+
+(test
+ (name test_spec)
+ (modules test_spec)
+ (libraries spec unix))
+
+; card a88d99 asks for the daemon-side binary to be named pp-cron.exe.
+(rule
+ (targets pp-cron.exe)
+ (deps pp_cron.exe)
+ (action
+  (copy %{dep:pp_cron.exe} %{targets})))
+
+(alias
+ (name default)
+ (deps pp-cron.exe))

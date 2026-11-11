@@ -1,0 +1,710 @@
+(project pp-cron
+ (* agent note (|2026-11-10, design session with the operator; chapter
+    authored in ~/dev/wyo.tech/sundial (an otherwise empty, non-git
+    workspace), NOT yet in the tuna repo. Nothing here is built; every
+    stanza is planned and the status field says so. Provenance: the
+    session settled four things in this order - an agent-first cron in
+    OCaml; tuna as the only central; cron runs as their own data type on
+    tuna (not claims, not the interpreter runs table); and the three
+    complexity candidates dialed back (no dispatch, no Postgres from the
+    box, no DBOS). The split-book question stays open: this file is
+    written standalone so it can move to a pp-cron repo unchanged, with
+    section ingest as the half meant to be lifted into tuna's borg/ next
+    to trace.borg and journal.borg if the operator wants it there.|) *)
+ (doc "pp-cron: an agent-first cron for the fleet. Schedule, execute, and record every firing on the box; ship the record to one central; treat the absence of a record as data. The agent lives at the triage end, never in the execution path.")
+ (status planned)
+ (convention ocaml-dune)
+ (no-inline)
+
+ (section law-local-execution
+  (doc "No firing depends on anything off-box, ever")
+  (status planned)
+  (details
+   (doc (|
+        The law, stated so it can be tested: with DNS dead, the network
+        unplugged, and tuna unreachable, every job still fires and every
+        run still lands in the local store. Shipping is a separate loop
+        in a separate failure domain whose only job is to drain a table.
+
+        Motivating incident (gregor, 2026-10-30): rc.d autolith_webui sat
+        in state 'failed' and nothing served the console port for ~38h.
+        No alert fired, because "no data arrived" was not an alertable
+        event anywhere in the stack. Every probe in the stack was
+        push-shaped and the pushes had stopped. See section heartbeat for
+        the mechanism that turns that silence into a verdict.
+
+        Consequence for the design: the scheduler may not block on a
+        socket, may not read a token over the network at fire time, and
+        may not consult central for any decision. If a future feature
+        cannot be implemented without breaking this, it belongs at
+        central instead.
+       |))))
+
+ (section run-record
+  (doc "One record definition; the local schema, the wire JSON, and the tuna table are all derived from it")
+  (status planned)
+  (details
+   (doc (|
+        The record is the product. Everything else in this book exists to
+        produce it faithfully or to move it. Defined once in lib/spec.ml:
+
+          type job = {
+            name : string ;
+            schedule : Schedule.t ;        (* cron expr + explicit tz *)
+            cmd : string list ;
+            env_file : string option ;     (* local, 0600 *)
+            timeout : float ;              (* seconds *)
+            overlap : [ `Skip | `Queue | `Kill of float ] ;
+            on_miss : [ `Skip | `Once | `All ] ;
+            retry : (int * float) option ; (* attempts, delay seconds *)
+            heartbeat : float ;            (* expected max gap, seconds *)
+            tags : string list ;
+          }
+
+          type run = {
+            box : string ;                 (* stable id, not hostname *)
+            run_id : string ;              (* ULID, minted on the box *)
+            job : string ;
+            occurrence : float ;           (* intended fire, unix epoch *)
+            started : float ;
+            finished : float option ;
+            exit : int option ;
+            signal : int option ;
+            verdict : [ `Ok | `Failed of string | `Timeout | `Missing ] ;
+            attempt : int ;
+            log_tail : string ;            (* bounded, 8 KiB *)
+          }
+
+        Field laws, each of which has a reason:
+
+        . box is a stable identifier assigned at install, never a
+          hostname. Hostnames change, get reused, and collide across
+          providers; a record keyed on hostname silently merges two boxes.
+        . run_id is a ULID minted on the box before the child starts, so
+          the id exists even if the daemon dies mid-run. Time-sortable,
+          which makes the outbox and the central table index-friendly.
+        . occurrence is the INTENDED wall-clock fire time, not the actual
+          start. A run that started 40s late still names the occurrence it
+          served, so gap analysis counts occurrences and never has to
+          guess. Two rows may share job+occurrence across attempts; they
+          differ in run_id and attempt.
+        . attempt counts within an occurrence, 1-based. Same occurrence
+          keeps the same run_id across retries and differs only in
+          attempt, so a job's own idempotency key has one obvious value.
+        . `Missing is a central-side constructor. A box never sends it. If
+          a box could send it, the absence of data would be
+          indistinguishable from data saying there was no work - which is
+          the failure this book exists to kill.
+
+        The executor exports the same facts to the child as environment
+        (section executor), so the record and the job see one truth.
+       |))))
+
+ (section schedule-files
+  (doc "One file per job on local disk; s-expressions; validated before the daemon will use them")
+  (status planned)
+  (details
+   (doc (|
+        /etc/pp-cron/jobs/<name>.sexp, one job per file, read at start
+        and on SIGHUP. No database, no network, no history. S-expressions
+        because the operator reads these by hand at 3am and because the
+        grammar costs 80 lines in lib/spec.ml:
+
+          (job "acme-renew"
+            (schedule "17 3 * * *")
+            (tz "UTC")
+            (cmd "/usr/local/bin/acme-client" "-n" "pricklypear.club")
+            (timeout 900)
+            (overlap skip)        ; skip | queue | kill
+            (on-miss once)        ; skip | once | all
+            (retry 2 300)         ; attempts, delay seconds
+            (heartbeat 93600)     ; expected max gap: 26h for a daily job
+            (tags ("tls" "club")))
+
+        Validation law: unknown keys and unknown values are REFUSED, not
+        ignored. A typo'd (overlap skpi) that silently defaults to the
+        wrong policy is how a poison job loops forever. check refuses the
+        whole file and names the line.
+
+        Heartbeat coherence: a job's declared heartbeat must be at least
+        its schedule cadence, otherwise central synthesizes false missing
+        verdicts for a healthy job. check computes the cadence from the
+        cron expression and refuses a heartbeat smaller than it.
+
+        `pp-cron check` parses and validates the whole directory and exits
+        nonzero on any error. It runs before rcctl restart and in CI, and
+        the daemon applies the same validation on reload: a bad file at
+        reload keeps the PREVIOUS job set running and logs the refusal.
+        Fail closed on config means keep executing the last known-good
+        set, never an empty set.
+
+        Nothing secret goes in these files. They are world-readable
+        configuration; secrets live in env files (below).
+       |))))
+
+  (subsection policies
+   (doc "overlap, on-miss, retry: the three things cron does not have and this tool exists for")
+   (status planned)
+   (details
+    (doc (|
+         overlap governs a firing whose predecessor is still running:
+         skip (default; the missed firing is RECORDED as skipped, not
+         silently dropped), queue (serialize, bounded queue of one), kill
+         (terminate the old process group after N seconds, record the old
+         run as killed-by-policy). The default is skip because the
+         pathology worth preventing is unbounded pile-up: one PP card
+         burned 399 of 617 runs in a poison loop, and an overlap queue
+         with no bound is the same bug with better manners.
+
+         on-miss governs firings whose time elapsed while the box was off
+         or the daemon was down: skip (default for anything periodic -
+         a scraper does not need 12 catch-up runs), once (one catch-up
+         firing, for renewals and anything that must catch up to now),
+         all (never use it; it exists because refusing to implement a
+         policy is how tools grow folklore).
+
+         retry governs a failed attempt within the same occurrence:
+         attempts and delay, recorded on the run row. Retry only covers
+         the process failing; a non-zero exit is a failure unless the job
+         declares ok-codes.
+
+         Auto-disable is REFUSED as a policy. pp-cron never stops running
+         a job because it keeps failing: a disabled job is an invisible
+         outage, indistinguishable from a removed job, and it removes the
+         evidence that would explain it. Persistent failure is escalated
+         with its record (section triage); disabling is a human decision
+         that lands as a file change with a diff.
+        |))))
+
+  (subsection env-and-secrets
+   (doc "Per-job env from a local 0600 file; never from central")
+   (status planned)
+   (details
+    (doc (|
+         (env-from "/etc/pp-cron/env/acme-renew.env") is parsed as
+         KEY=VALUE, no shell expansion, no quoting subtleties, and the
+         file must be mode 0600 owned by the daemon user or the job is
+         refused with a named error. A job runner concentrates every
+         credential on the box; the one thing it must not do is widen
+         their reach to a network service. Central holds no secrets for
+         the box, in either direction.
+
+         Environment is inherited minimal: PATH, HOME, TZ from the job's
+         declared tz, plus the RUN_ID contract. no TERM, no LOGNAME, no
+         shell rc reading.
+        |))))
+
+ (section scheduler
+  (doc "A min-heap on a monotonic clock; the loop touches nothing but local time and SQLite")
+  (status planned)
+  (details
+   (doc (|
+        State: a min-heap of next fire times keyed on CLOCK_MONOTONIC -
+        wall clock is used only to COMPUTE an occurrence, never to wait on.
+        A wait computed against wall clock is a wait that storms forward
+        when NTP steps the clock, and cron's own history with that bug is
+        long. On a wall-clock step the scheduler recomputes the next
+        occurrences from the persisted last-fire state instead of trusting
+        its sleep deadline.
+
+        Timezones: each job declares its tz and the occurrence is computed
+        in that timezone with an explicit DST rule - a 03:17 daily job in a
+        zone that skips 02:00-03:00 is a per-job decision, not an accident
+        of the runtime's localtime. Default tz is UTC and the file must say
+        so explicitly if it wants local time.
+
+        The loop order is fixed: pop due, check overlap, insert running row
+        (one transaction), dispatch, compute next fire, repeat. It never
+        waits on a child, never on a socket, never on a lock it does not
+        own.
+
+        Single instance is enforced by flock on the pidfile (section
+        deployment); a second start exits 0 with a message rather than
+        fighting for the heap.
+       |))))
+
+ (section executor
+  (doc "fork/exec in a fresh process group, deadline, group kill, log to a spool file")
+  (status planned)
+  (details
+   (doc (|
+        Spawn: fork, setpgid in the child, exec the argv directly (no
+        shell unless the job declares one). A fresh process group is what
+        makes the deadline enforce anything: killing a child that spawned
+        a grandchild otherwise leaves the grandchild running and the job
+        appears to succeed while its work continues.
+
+        Deadline: SIGTERM to the group, grace period (default 10s),
+        SIGKILL to the group, reap. Verdict timeout, and the row records
+        which signal ended what.
+
+        Output: the child's stdout+stderr go to a spool file under
+        /var/db/pp-cron/spool/, never a pipe. A pipe deadlocks the child
+        the moment a chatty job fills the 64 KiB buffer and nobody is
+        reading; a spool file costs one disk write and bounds the problem
+        to disk. At reap, the tail (default 8 KiB) plus total byte count
+        go into the record and the spool file is removed. The byte count
+        matters: "8 KiB retained of 1.2 GiB" tells the reader the tail is
+        not the whole story.
+
+        Environment contract, the only durability hook pp-cron offers:
+
+          RUN_ID            stable across retries of one occurrence
+          PP_CRON_JOB       job name
+          PP_CRON_OCCURRENCE  intended fire, unix epoch
+          PP_CRON_ATTEMPT   1-based
+          PP_CRON_BOX       stable box id
+
+        Same RUN_ID across retries is the point: a job that needs
+        idempotency (an upload, a payment, a card transition) keys on it
+        and becomes safe to retry without the scheduler knowing anything
+        about its internals. Anything stronger requires owning the job's
+        control flow, which is out of scope by section non-goals.
+       |))))
+
+ (section store
+  (doc "/var/db/pp-cron/runs.db: SQLite is the source of truth, and a run row commits with its outbox row")
+  (status planned)
+  (details
+   (doc (|
+        SQLite, WAL mode, synchronous=NORMAL, one writer (the daemon). The
+        local schema is PRIVATE to the daemon and versioned with user_version
+        - it is not the wire format. The wire format is the record in
+        section run-record, serialized explicitly, so a local migration
+        never becomes an ingest break.
+
+          runs (run_id text PRIMARY KEY, box, job, occurrence real,
+                started real, finished real NULL, exit_code int NULL,
+                signal int NULL, verdict text, failure_class text NULL,
+                attempt int, log_tail text, log_bytes int NULL,
+                running int NOT NULL DEFAULT 0)
+          outbox (run_id text PRIMARY KEY, payload text NOT NULL,
+                  created_at real, attempts int DEFAULT 0)
+          heartbeats (id integer PRIMARY KEY AUTOINCREMENT, ts real,
+                      jobs_loaded int, pending_outbox int, in_flight int)
+          dead_letter (run_id text PRIMARY KEY, payload text, reason text,
+                       at real)
+          meta (k text PRIMARY KEY, v text)
+
+        Transaction law: a terminal run row and its outbox row commit in
+        ONE transaction. A run row without a matching outbox row is
+        unshippable and invisible, which is precisely the class of failure
+        this design exists to eliminate. This is the one idea worth taking
+        from DBOS (its transact pattern: state change and its queued
+        effect in one commit).
+
+        Shipping law: unsent outbox rows are NEVER pruned. Retention prunes
+        terminal runs older than N days (default 30) subject to a size
+        cap, and heartbeats older than M days (default 90, they are tiny).
+        A row whose payload could not be delivered lives in dead_letter
+        with a reason and is surfaced in `pp-cron status`; it is dropped
+        only by an explicit human command.
+
+        A `running` row exists while a child is alive so that overlap
+        checks and crash forensics both have local truth. Running rows are
+        not shipped (they would churn); a daemon that dies mid-run leaves
+        the row, and the next start marks it interrupted (verdict failed,
+        failure_class daemon-restart) rather than pretending it finished.
+       |))))
+
+ (section outbox
+  (doc "A dumb batch shipper in its own failure domain; blind retries are safe by construction")
+  (status planned)
+  (details
+   (doc (|
+        Loop: take up to 200 pending rows oldest-first, POST, delete on
+        2xx, exponential backoff with jitter on 5xx and transport errors
+        (1s doubling to a 5m ceiling), and on a 4xx that repeats three
+        times move the payload to dead_letter and log it. Never drop
+        silently, never block a firing, never grow the queue by retrying
+        in a tight loop.
+
+        Retries are blind because the receiver is idempotent: tuna's
+        UNIQUE (box, run_id) plus upsert makes a duplicate post a no-op
+        and a later post of the same run a supersede. The shipper does not
+        track delivery state beyond "still in outbox", which is what keeps
+        it dumb enough to be reliable.
+
+        A Sink module with one HTTP implementation. A second sink
+        (section non-goals) changes nothing above it: same table, same
+        loop, same blind retry.
+
+        Backpressure is bounded, not unbounded: if pending exceeds a
+        threshold the daemon logs loudly and `status` says so. A box whose
+        network has been down for a month should be visibly queued, not
+        silently absorbing.
+       |))))
+
+ (section heartbeat
+  (doc "The dead-man switch: silence becomes a verdict")
+  (status planned)
+  (details
+   (doc (|
+        Two independent signals, because they fail independently.
+
+        Box liveness: every 60s the daemon posts
+        {box, ts, uptime_s, jobs_loaded, pending_outbox, in_flight}
+        to POST /api/cron/heartbeat, independent of any job. Central sweeps
+        for boxes whose last heartbeat is older than 3x their declared
+        interval and opens an incident. This catches a dead daemon - the
+        gregor 38h case - where per-job analysis cannot, because a dead
+        daemon produces no job rows at all and "no rows" is
+        indistinguishable from "job removed".
+
+        Schedule snapshot: on start and on every successful reload, the
+        daemon posts its parsed job set (name, schedule, tz, heartbeat
+        policy, timeout) to POST /api/cron/jobs, which replaces that box's
+        snapshot. Central needs the cadence to reason about what SHOULD
+        have fired; deriving it from observed rows is circular and would
+        make a job that stopped firing look like a job that never existed.
+
+        Absence synthesis: central compares each job's expected occurrence
+        series against observed cron_runs and inserts rows with
+        verdict='missing' for occurrences that never arrived, once they are
+        older than the job's declared heartbeat. Those rows are
+        synthesized only when the box was ALIVE (heartbeat present) for
+        that window; a box whose daemon was down gets one incident about
+        the daemon, not four hundred missing-run rows about its jobs. The
+        distinction between "the box was dead" and "this job was dead" is
+        the whole value of having both signals.
+       |))))
+
+ (section ingest
+  (doc "tuna owns the central record: its own table, its own endpoints, write-only")
+  (status planned)
+  (details
+   (doc (|
+        OPERATOR DECISION (2026-11-10): tuna is the only central. It is
+        already OCaml/dune, already behind relayd with TLS on
+        pricklypear.club, already has identities and bearer tokens, already
+        has Postgres. One ingest endpoint and one table beats standing up a
+        new service, and a second central means two notions of "did this
+        fire" to reconcile - the exact bug class this project exists to
+        kill. PP gets a read-only view of this data later (subsection
+        lens); it does not get a second ingest path.
+       |))))
+
+  (subsection not-claims
+   (doc "Cron runs are not claims and not tree rows")
+   (status planned)
+   (details
+    (doc (|
+         A claim in tuna is identified by its PATH and is a publication act:
+         a citable, re-derivable assertion, enumerated by /claims. A cron
+         run is telemetry - high cardinality, expiring, cited by run_id and
+         not by path. Two lifecycles, two tables. When a claim needs to
+         refer to a run it cites the run_id in its body.
+
+         The mechanical reason is stronger than the conceptual one. The
+         deployed floor (g1) gates tree ops on the caller's path_prefix and
+         ignores prim, so read-without-write is not expressible there, and
+         raw string prefixes collide ('u.agora' covers u.agora-rogue.*). A
+         per-minute write stream behind that floor forces every box to hold
+         read+write on its whole prefix and the laptop identity to hold a
+         prefix covering every box. Revisit only if the auth rework lands
+         read-only grants; the volume and lifecycle arguments survive it.
+        |))))
+
+  (subsection not-runs
+   (doc "Not the interpreter runs table either")
+   (status planned)
+   (details
+    (doc (|
+         tuna's runs (0001) are interpreter runs: program_hash NOT NULL
+         REFERENCES programs(hash), fuel, size_cap, step_count,
+         result_hash, journal chain, verify_status, run_traces. A process
+         run has none of that and would contribute eight nulls plus a
+         filter on every existing query and page. Sharing the table would
+         also mean sharing the id space with the calculus and its replay
+         verifier. Separate table, separate module, separate endpoints -
+         the same call trace.borg made for its own summary rows.
+        |))))
+
+  (subsection schema
+   (doc "migrations/0018-cron-runs.sql: idempotent DDL, self-registering, as 0001-0017 do it")
+   (status planned)
+   (details
+    (doc (|
+         CREATE TABLE IF NOT EXISTS cron_runs (
+           id uuid PRIMARY KEY DEFAULT gen_random_uuid(),
+           box text NOT NULL,                  -- stable box id
+           run_id text NOT NULL,               -- ULID from the box
+           job text NOT NULL,
+           occurrence timestamptz NOT NULL,    -- intended fire
+           started timestamptz NOT NULL,
+           finished timestamptz NULL,
+           exit_code int NULL,
+           signal int NULL,
+           verdict text NOT NULL,              -- ok|failed|timeout|missing
+           failure_class text NULL,
+           attempt int NOT NULL DEFAULT 1,
+           log_tail text NULL,
+           log_bytes bigint NULL,
+           caller uuid NULL REFERENCES identities(id),
+           received_at timestamptz NOT NULL DEFAULT now(),
+           UNIQUE (box, run_id));
+
+         CREATE INDEX cron_runs_box_idx ON cron_runs (box, occurrence DESC);
+         CREATE INDEX cron_runs_job_idx ON cron_runs (job, occurrence DESC);
+
+         CREATE TABLE IF NOT EXISTS cron_heartbeats (
+           box text NOT NULL,
+           ts timestamptz NOT NULL,
+           uptime_s bigint NULL,
+           jobs_loaded int NULL,
+           pending_outbox int NULL,
+           in_flight int NULL,
+           PRIMARY KEY (box, ts));
+
+         CREATE TABLE IF NOT EXISTS cron_jobs (
+           box text NOT NULL,
+           job text NOT NULL,
+           schedule text NOT NULL,
+           tz text NOT NULL,
+           heartbeat_s int NOT NULL,
+           timeout_s int NOT NULL,
+           tags text[] NOT NULL DEFAULT '{}',
+           seen_at timestamptz NOT NULL DEFAULT now(),
+           PRIMARY KEY (box, job));
+
+         CREATE TABLE IF NOT EXISTS cron_rollups (
+           box text NOT NULL, job text NOT NULL, day date NOT NULL,
+           fired int NOT NULL, ok int NOT NULL, failed int NOT NULL,
+           missing int NOT NULL,
+           PRIMARY KEY (box, job, day));
+
+         UNIQUE (box, run_id) is the entire idempotency story: the shipper
+         retries blindly and the ingest upserts ON CONFLICT (box, run_id)
+         DO UPDATE. received_at is server time and the only column central
+         invents; everything else is the box's word.
+
+         Retention: a daily rollup job folds raw rows older than 90 days
+         into cron_rollups and deletes them, the move run_traces labels as
+         GC-able bulk data. "Did this fire every day for a year" survives;
+         the log tail does not, which is the right trade for the tail.
+        |))))
+
+  (subsection surface
+   (doc "Four write endpoints and a read surface; no dispatch")
+   (status planned)
+   (details
+    (doc (|
+         POST /api/cron/runs        batch ingest, idempotent upsert
+         POST /api/cron/jobs        replace one box's schedule snapshot
+         POST /api/cron/heartbeat   liveness
+         GET  /api/cron/runs        ?box= &job= &since= &verdict= , paged
+         GET  /api/cron/jobs        expected cadences per box
+         GET  /api/cron/summary     per box/job: last run, last ok, gap,
+                                    pending outbox, open incidents
+
+         Write-only from the box's perspective. There is NO dispatch
+         endpoint and no command surface in v1: the moment central can
+         name a command, a central compromise is remote code execution on
+         every installed box with whatever privilege the daemon has. Remote
+         dispatch needs signed job bundles and its own threat model
+         (section non-goals), and it is not needed for the motivating
+         failures.
+        |))))
+
+  (subsection identity
+   (doc "One tuna identity per box; caller comes from the token, and box must match it")
+   (status planned)
+   (details
+    (doc (|
+         Each box is minted an identity the way marin was minted: a name, a
+         bearer token, no garden. Ingest authenticates on the bearer and
+         sets caller from it; box in the payload must equal the caller's
+         identity name or the batch is refused whole (400, no partial row
+         write). So gregor's token cannot write wyo rows, and a compromised
+         box can forge rows about itself and nothing else.
+
+         Tokens are per-box, revocable by setting identities.token_hash to
+         a new value and rcctl restart, exactly as the root rotation
+         procedure already does. The box reads its token from a 0640 file
+         at startup and fails closed if it is missing. Tokens never appear
+         in logs, in the schedule files, or in the record.
+        |))))
+
+  (subsection lens
+   (doc "PP sees cron_runs read-only through the lens; it is not a sync participant")
+   (status planned)
+   (details
+    (doc (|
+         Later, not v1. The board wants run rows next to cards, so a
+         read-only projection of cron_runs into PP prims (space series,
+         own type) served through the lens is the shape. Direction matters:
+         space rows WRITTEN INTO the lens substrate are force-pulled and
+         superseded (the gregor-memory lesson), so the lens is a reader
+         here and tuna is the writer. Nothing about that projection can
+         make a job fire or a row ship.
+        |))))
+
+ (section triage
+  (doc "Agent-first means the agent reads the record, never the scheduler")
+  (status planned)
+  (details
+   (doc (|
+        The boundary, stated as a hard line: no agent, model, or remote
+        service is consulted before or during a firing. Nothing on the
+        firing path is probabilistic, and no job can be delayed, skipped,
+        or started because a remote thing was thinking.
+
+        Where the agent earns its keep is after the fact. A verdict of
+        failed, timeout, or missing with no acknowledged triage opens a PP
+        card or an agent run with the run row attached (log tail, byte
+        count, attempt history, sibling runs of the same job). The agent
+        reads the log, decides fix / escalate / annotate, and writes that
+        decision somewhere durable. It cannot disable a job, edit a
+        schedule, or retry on its own in v1; those need signed bundles.
+
+        Deduplication matters more than intelligence here: one openness
+        per (box, job, failure_class) window, not one per failing run. The
+        399-run poison loop produced 399 records and one bug; triage must
+        open one card for it.
+       |))))
+
+ (section deployment
+  (doc "rc.d, unprivileged by default, named-command privilege escalation")
+  (status planned)
+  (details
+   (doc (|
+        OpenBSD first (gregor, pricklypear.club, wyo.town), Linux where
+        needed. A single static binary from dune, no runtime deps:
+        pp-cron.exe.
+
+        . user _ppcron, /sbin/nologin, no home
+        . /etc/pp-cron/jobs/ (0755), /etc/pp-cron/env/ (0700), token 0640
+        . /var/db/pp-cron/ owned by _ppcron (runs.db, spool/)
+        . rc.d/ppcron with daemon_flags, flock on the pidfile
+        . newsyslog entry: keep 7 rotations, the daemon reopens on SIGUSR1
+
+        Privilege: the daemon runs unprivileged and stays unprivileged. A
+        job that needs root declares it and the schedule is checked at load
+        against /etc/doas.conf, where the named command is permitted
+        explicitly. Never a general doas rule for the daemon user: the
+        privileged commands are a reviewed list on disk, not a property of
+        the runner. This is the same class of decision as the PP
+        supervisor's unprivileged-identity setting, made at install time
+        instead of discovered at 3am.
+
+        Upgrades: install a new binary, `pp-cron check`, rcctl restart. The
+        store migrates forward on start under user_version and refuses to
+        start on a newer schema than it knows.
+       |))))
+
+ (section non-goals
+  (doc "Refused in v1, with the seam where each could return")
+  (status planned)
+  (details
+   (doc (|
+        Per-box web server. A loopback unix socket serving status is the
+        whole surface, and the `status` subcommand reads it. A fleet of
+        small HTTP servers is a fleet of things to harden, patch, and
+        monitor, in service of a dashboard nobody asked for.
+
+        Remote dispatch. Seam: a signed job bundle verified by the daemon,
+        with its own threat model. Not v1, not implied by ingest.
+
+        Postgres from the box. Central store on Postgres: yes, tuna already
+        has it. The box talking Postgres directly: no - a credential that
+        can write the record table on every box, 5432 reachability as a
+        design constraint on central's topology, and schema coupling where
+        a daemon compromise becomes a central write primitive. Seam: the
+        Sink module, with insert-only per-box roles if it ever earns its
+        place. Revisit after a thousand shipped runs.
+
+        DBOS or any embedded durable-execution engine. DBOS is a library
+        embedded in the program being made durable (Python, TypeScript,
+        Go, Java, Rust), and its scheduled-jobs feature competes with this
+        tool rather than plugging into it. Baking it in collapses to
+        reimplementing deterministic replay and step checkpointing in OCaml,
+        or requiring every job to be a DBOS app with a Postgres on every
+        box. Durability is a property of the job's code, not of the
+        scheduler: pp-cron offers RUN_ID and attempt, and a job that needs
+        step-level resumption should be written in a language that has it
+        and treated as a dumb process that exits. That composition is the
+        point.
+
+        Workflow DAGs. No cross-job dependencies, no fan-in, no
+        scheduler-level graphs. The fleet already has a durable workflow
+        engine on a Postgres with run states, heartbeats and replay counts
+        - glochid over PP run rows - and agent work belongs there.
+
+        Auto-disable. Refused, see subsection policies, with the reason:
+        a disabled job is an invisible outage carrying its own alibi.
+       |))))
+
+ (section acceptance
+  (doc "Falsifiable gates; each one kills a specific way this design could be a lie")
+  (status planned)
+  (details
+   (doc (|
+        A1 harbor-kill: stop tuna, run a job. Row lands locally, ships
+        after tuna returns, exactly one row on the far side. Proves the
+        local-first law.
+
+        A2 netless: no route to central, jobs still fire on schedule for an
+        hour, outbox grows, drains on reconnect with no duplicates.
+
+        A3 daemon-kill: SIGKILL the daemon. Central reports a heartbeat gap
+        within 3x the interval AND per-job missing rows are NOT synthesized
+        for the dead window (the box was dead, the jobs were not). Proven
+        by asserting incident count and missing-row count separately.
+
+        A4 duplicate-post: post the same batch twice; one row, updated
+        received_at, no error. Post a superseding payload for the same
+        (box, run_id); the later state wins.
+
+        A5 bad-config: corrupt one schedule file; `check` exits nonzero;
+        SIGHUP keeps the previous job set running and logs the refusal.
+        Proves fail-closed reload.
+
+        A6 timeout-orphan: job spawns a grandchild that outlives the
+        deadline; after the kill, the process group is empty (ps check) and
+        the verdict is timeout.
+
+        A7 chatty: job writes 1 GiB; no deadlock, log_bytes reports the
+        true size, log_tail is the last 8 KiB.
+
+        A8 clock-step: step the wall clock forward 2h and back 2h under a
+        running daemon; no firing storm, no skipped occurrence, occurrence
+        values match the schedule.
+
+        A9 retention: prune with unsent outbox rows present; the runs
+        table shrinks and the outbox is untouched.
+
+        A10 confinement: gregor's token posting box=wyo is refused whole
+        (400), and no partial rows land.
+
+        A11 false-missing: a daily job with heartbeat 26h and one late
+        fire does not produce a missing verdict; the synthetic row appears
+        only after the declared gap and only for a live box window.
+
+        Each gate names the failure it forbids. A chapter that can only be
+        demonstrated by a working dashboard is not this chapter.
+       |))))
+
+ (section open-questions
+  (doc "Recorded so the next session does not relitigate from scratch")
+  (status planned)
+  (details
+   (doc (|
+        . WireGuard topology: which of gregor, pricklypear.club,
+          pricklypear.rocks, wyo.town can POST to tuna over TLS and which
+          need a route. Blocking for install, not for design; the answer
+          picks whether ingest is public-TLS or tunnel-only.
+        . Root jobs: how many exist, and whether the doas named-command
+          list stays small enough to review. If it cannot stay small, the
+          alternative is a separate root-configured instance, which is a
+          different security story.
+        . Running-state rows: v1 ships terminal rows only. If overlap and
+          in-flight visibility at central turn out to matter more than
+          churn, ship the running row too and let the upsert handle it.
+        . Where this book lives long-term: standalone pp-cron repo, or
+          section ingest lifted into tuna's borg/ beside trace.borg. Both
+          were on the table on 2026-11-10 and neither was decided; the
+          split is deliberately written along that seam.
+        . PP projection (subsection lens): which space, which prim type,
+          and whether the board wants one row per run or per day.
+       |))))
+)

@@ -14,10 +14,15 @@
  (modules store)
  (libraries spec unix))
 
+; card S3b: the outbox shipper - the duplicate-ACK ship loop.
+(library
+ (name outbox)
+ (modules outbox))
+
 (executable
  (name pp_cron)
  (modules pp_cron)
- (libraries spec store unix))
+ (libraries spec store outbox unix))
 
 (test
  (name test_spec)
@@ -33,6 +38,11 @@
  (name heartbeat_test)
  (modules heartbeat_test)
  (libraries heartbeat unix))
+
+(test
+ (name outbox_test)
+ (modules outbox_test)
+ (libraries outbox unix))
 
 ; card a88d99 asks for the daemon-side binary to be named pp-cron.exe.
 (rule

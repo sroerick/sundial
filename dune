@@ -8,15 +8,26 @@
  (modules heartbeat)
  (libraries unix))
 
+; card S3a: the durable run-record store that replaces the S2 jsonl stub.
+(library
+ (name store)
+ (modules store)
+ (libraries spec unix))
+
 (executable
  (name pp_cron)
  (modules pp_cron)
- (libraries spec unix))
+ (libraries spec store unix))
 
 (test
  (name test_spec)
  (modules test_spec)
  (libraries spec unix))
+
+(test
+ (name store_test)
+ (modules store_test)
+ (libraries spec store unix))
 
 (test
  (name heartbeat_test)

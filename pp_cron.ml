@@ -1,5 +1,6 @@
-(* pp-cron command line. S1 (card a88d99) ships `check` only: the record,
-   the schedule grammar and its validation. No scheduler, no executor. *)
+(* pp-cron command line. S1 (card a88d99) ships `check`: the record, the
+   schedule grammar and its validation. S3a (card d1b6ba) links the
+   durable run-record store (store.ml), exercised by store_test. *)
 
 let usage =
   "usage: pp-cron check [<jobs-dir>...]\n\

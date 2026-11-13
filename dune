@@ -3,6 +3,11 @@
  (modules spec)
  (libraries unix))
 
+(library
+ (name heartbeat)
+ (modules heartbeat)
+ (libraries unix))
+
 (executable
  (name pp_cron)
  (modules pp_cron)
@@ -12,6 +17,11 @@
  (name test_spec)
  (modules test_spec)
  (libraries spec unix))
+
+(test
+ (name heartbeat_test)
+ (modules heartbeat_test)
+ (libraries heartbeat unix))
 
 ; card a88d99 asks for the daemon-side binary to be named pp-cron.exe.
 (rule

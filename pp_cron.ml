@@ -8,13 +8,17 @@
 
 let usage =
   "usage: pp-cron check [<jobs-dir>...]\n\
+  \  pp-cron run [--jobs <dir>] [--store <file>] [--watch]\n\
   \  pp-cron ship [<queue-file>]\n\
   \  (default jobs directory: /etc/pp-cron/jobs)\n\
+  \  (default store: $PP_CRON_STORE or /var/db/pp-cron/runs.jsonl)\n\
   \  (default queue: $PP_CRON_OUTBOX or /var/db/pp-cron/outbox)\n\
   \  (sink: $PP_CRON_SINK or http://127.0.0.1:8080/api/cron/runs)"
 
 let default_sink = "http://127.0.0.1:8080/api/cron/runs"
 let default_outbox = "/var/db/pp-cron/outbox"
+let default_store = "/var/db/pp-cron/runs.jsonl"
+let default_spool = "/var/db/pp-cron/spool"
 let post_timeout = 5.
 
 (* ------------------------------------------------------------------ *)
@@ -144,8 +148,68 @@ let () =
      | Error e ->
        prerr_endline ("pp-cron: ship: " ^ e);
        exit 1)
-  | _ :: ("run" | "status" | "serve") :: _ ->
-    prerr_endline "pp-cron: not implemented in this card (record + check only)";
+  | _ :: "run" :: rest ->
+    (* S2: one tick fires every job whose schedule matches the CURRENT
+       minute; --watch ticks once a minute. The occurrence is the minute
+       served, never the instant the tick happened to run. *)
+    let jobs_dir = ref None and store = ref None and watch = ref false in
+    let rec flags = function
+      | [] -> ()
+      | "--jobs" :: d :: tl -> jobs_dir := Some d; flags tl
+      | "--store" :: s :: tl -> store := Some s; flags tl
+      | "--watch" :: tl -> watch := true; flags tl
+      | d :: tl -> jobs_dir := Some d; flags tl
+    in
+    flags rest;
+    let dir =
+      match !jobs_dir with
+      | Some d -> d
+      | None -> (
+        match Sys.getenv_opt "PP_CRON_JOBS" with
+        | Some d -> d
+        | None -> "/etc/pp-cron/jobs")
+    in
+    let store_path =
+      match !store with
+      | Some p -> p
+      | None -> (
+        match Sys.getenv_opt "PP_CRON_STORE" with
+        | Some p -> p
+        | None -> default_store)
+    in
+    let spool =
+      match Sys.getenv_opt "PP_CRON_SPOOL" with
+      | Some p -> p
+      | None -> default_spool
+    in
+    let box = Sched.box_id () in
+    let jobs = ref (Spec.load dir) in
+    let once () =
+      match
+        Sched.tick ~store:store_path ~spool ~box ~now:(Unix.gettimeofday ()) !jobs
+      with
+      | Ok 0 -> 0
+      | Ok n ->
+        Printf.printf "pp-cron: fired %d job(s)\n" n;
+        0
+      | Error e ->
+        prerr_endline ("pp-cron: run: " ^ e);
+        1
+    in
+    if not !watch then exit (once ())
+    else begin
+      let rec loop () =
+        ignore (once ());
+        jobs := Spec.load ~prev:!jobs dir;
+        let t = Unix.gettimeofday () in
+        ignore (Unix.select [] [] [] (60. -. Float.rem t 60. +. 0.05));
+        loop ()
+      in
+      loop ()
+    end
+  | _ :: ("status" | "serve") :: _ ->
+    prerr_endline
+      "pp-cron: not implemented in this card (record + check + ship + run)";
     exit 2
   | _ ->
     prerr_endline usage;

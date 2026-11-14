@@ -51,6 +51,36 @@
  (action
   (copy %{dep:pp_cron.exe} %{targets})))
 
+; card 43a6c99d, P1/P2: the node connector - the doorbell (webhook) and
+; the static-mesh wireguard key authority.
+(library
+ (name node_connector)
+ (modules node_connector)
+ (libraries spec unix))
+
+(executable
+ (name pp_node)
+ (modules pp_node)
+ (libraries node_connector spec unix))
+
+; card 43a6c99d: the three acceptance tests for the node connector, wired
+; into `dune runtest` so the doorbell, the key authority and the tier law
+; are exercised by the build itself.
+(rule
+ (alias runtest)
+ (deps tests/webhook_receiver.sh DECISIONS.md pp_node.exe)
+ (action (run sh %{dep:tests/webhook_receiver.sh})))
+
+(rule
+ (alias runtest)
+ (deps tests/peer_mint.sh DECISIONS.md pp_node.exe)
+ (action (run sh %{dep:tests/peer_mint.sh})))
+
+(rule
+ (alias runtest)
+ (deps tests/peer_tier.sh DECISIONS.md pp_node.exe)
+ (action (run sh %{dep:tests/peer_tier.sh})))
+
 (alias
  (name default)
- (deps pp-cron.exe))
+ (deps pp-cron.exe pp_node.exe))

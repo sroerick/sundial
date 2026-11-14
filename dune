@@ -14,6 +14,12 @@
  (modules store)
  (libraries spec unix))
 
+; card 9f2fd78a: the S2 scheduler + executor over the run-record store.
+(library
+ (name sched)
+ (modules sched)
+ (libraries spec store unix))
+
 ; card S3b: the outbox shipper - the duplicate-ACK ship loop.
 (library
  (name outbox)
@@ -22,7 +28,7 @@
 (executable
  (name pp_cron)
  (modules pp_cron)
- (libraries spec store outbox unix))
+ (libraries spec sched store outbox unix))
 
 (test
  (name test_spec)
@@ -33,6 +39,11 @@
  (name store_test)
  (modules store_test)
  (libraries spec store unix))
+
+(test
+ (name sched_test)
+ (modules sched_test)
+ (libraries spec sched store unix))
 
 (test
  (name heartbeat_test)

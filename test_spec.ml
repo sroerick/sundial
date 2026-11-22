@@ -156,6 +156,39 @@ let () =
    | Ok jobs -> check "env-from mode 0600 is accepted" (List.length jobs = 1)
    | Error _ -> check "env-from mode 0600 is accepted" false);
 
+  (* --- law: every record carries box-emitted evidence; ingest checks it --- *)
+  let store = fresh "store" in
+  let record =
+    Spec.finish_run ~start `Ok ~finished:(start.Spec.started +. 3.) ~exit:0
+      ~log_tail:"renewed\n" ()
+  in
+  check "the box emits evidence with the record" (record.Spec.evidence <> "");
+  (match Spec.ingest store record with
+   | Ok () -> check "ingest accepts a record whose evidence matches" true
+   | Error e -> check ("ingest accepts a record whose evidence matches: " ^ e) false);
+  check "verify over untouched stored records yields no complaints"
+    (Spec.verify_store store = []);
+
+  (* --- law: an altered stored record is named by run_id, exit non-zero --- *)
+  let tampered = { record with Spec.verdict = `Failed "rewritten" } in
+  Spec.write_record store tampered;
+  (match Spec.verify_store store with
+   | [] -> check "verify names an altered record by run_id" false
+   | errs ->
+     check "verify names an altered record by run_id"
+       (List.exists (fun e -> has_sub e record.Spec.run_id) errs));
+
+  (* --- law: ingest rejects a record whose evidence fails, stores nothing --- *)
+  let store2 = fresh "store-reject" in
+  refused := [];
+  (match Spec.ingest ~log store2 tampered with
+   | Ok () -> check "ingest rejects a record whose evidence fails" false
+   | Error _ -> check "ingest rejects a record whose evidence fails" true);
+  check "rejection is logged" (List.exists (fun m -> has_sub m "REJECTED") !refused);
+  check "a rejected record is not stored"
+    (not (Sys.file_exists (Filename.concat store2 (record.Spec.run_id ^ ".run"))));
+  check "an empty store verifies clean" (Spec.verify_store store2 = []);
+
   if !failures = 0 then print_endline "pp-cron spec: all laws hold"
   else begin
     Printf.printf "pp-cron spec: %d failure(s)\n" !failures;

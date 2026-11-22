@@ -58,6 +58,7 @@ type run = {
   verdict : verdict;
   attempt : int;
   log_tail : string;              (* bounded, 8 KiB *)
+  evidence : string;              (* emitted by the box, never recomputed silently here *)
 }
 
 let to_verdict (v : box_verdict) : verdict =
@@ -74,6 +75,49 @@ let log_tail_cap = 8192
 let bounded_log_tail s =
   let n = String.length s in
   if n <= log_tail_cap then s else String.sub s (n - log_tail_cap) log_tail_cap
+
+(* ------------------------------------------------------------------ *)
+(* Tamper evidence                                                     *)
+(*                                                                     *)
+(* The box emits, with every record, the evidence it computed over the *)
+(* record's canonical payload. Central recomputes it at ingest and at  *)
+(* verify over the STORED fields, so a record altered in flight or at  *)
+(* rest is refused rather than believed.                               *)
+(* ------------------------------------------------------------------ *)
+
+let evidence_key () =
+  match Sys.getenv_opt "PP_CRON_EVIDENCE_KEY" with
+  | Some k when k <> "" -> k
+  | _ -> "pp-cron-evidence-v1"  (* dev default; install sets the daemon's key *)
+
+(* Length-prefixed fields: a log tail cannot forge a field boundary. *)
+let field_of s = Printf.sprintf "%d:%s" (String.length s) s
+
+let float_bit = function None -> "none" | Some f -> Printf.sprintf "%.6f" f
+let int_bit = function None -> "none" | Some n -> string_of_int n
+
+let wire_verdict = function
+  | `Ok -> "ok"
+  | `Timeout -> "timeout"
+  | `Missing -> "missing"
+  | `Failed r -> "failed:" ^ r
+
+(* Everything the box signed, and nothing it did not: [evidence] is
+   excluded or the digest could never be recomputed from the record. *)
+let payload_of_record (r : run) =
+  String.concat ""
+    [ field_of r.box; field_of r.run_id; field_of r.job;
+      field_of (Printf.sprintf "%.6f" r.occurrence);
+      field_of (Printf.sprintf "%.6f" r.started);
+      field_of (float_bit r.finished);
+      field_of (int_bit r.exit);
+      field_of (int_bit r.signal);
+      field_of (wire_verdict r.verdict);
+      field_of (string_of_int r.attempt);
+      field_of r.log_tail ]
+
+let evidence_of_record (r : run) =
+  Digest.to_hex (Digest.string (evidence_key () ^ "\000" ^ payload_of_record r))
 
 (* ------------------------------------------------------------------ *)
 (* run_id: a ULID minted on the box before exec                        *)
@@ -109,17 +153,21 @@ let begin_run ~box ~job ~occurrence ~now ?(attempt = 1) () =
    one occurrence; only [attempt] differs. *)
 let finish_run ~(start : run_start) (v : box_verdict) ~finished ?exit ?signal
     ?(log_tail = "") () =
-  { box = start.box;
-    run_id = start.run_id;
-    job = start.job;
-    occurrence = start.occurrence;
-    started = start.started;
-    finished = Some finished;
-    exit;
-    signal;
-    verdict = to_verdict v;
-    attempt = start.attempt;
-    log_tail = bounded_log_tail log_tail }
+  let partial =
+    { box = start.box;
+      run_id = start.run_id;
+      job = start.job;
+      occurrence = start.occurrence;
+      started = start.started;
+      finished = Some finished;
+      exit;
+      signal;
+      verdict = to_verdict v;
+      attempt = start.attempt;
+      log_tail = bounded_log_tail log_tail;
+      evidence = "" }
+  in
+  { partial with evidence = evidence_of_record partial }
 
 (* ------------------------------------------------------------------ *)
 (* Refusal: every error names file:line                                *)
@@ -519,3 +567,203 @@ let load ?(prev = []) ?(log = fun m -> prerr_endline ("pp-cron: " ^ m)) dir =
   | Error errs ->
     List.iter log errs;
     prev
+
+(* ------------------------------------------------------------------ *)
+(* Central: what the box emitted is what central stores, and verify    *)
+(* recomputes the evidence over the STORED fields                      *)
+(* ------------------------------------------------------------------ *)
+
+let record_suffix = ".run"
+
+(* The escapes are the ones the reader understands; every other byte is
+   copied verbatim, so a stored record round-trips and the evidence is
+   checked against the record the box signed. *)
+let quote s =
+  let b = Buffer.create (String.length s + 2) in
+  Buffer.add_char b '"';
+  String.iter
+    (fun c ->
+       match c with
+       | '"' -> Buffer.add_string b "\\\""
+       | '\\' -> Buffer.add_string b "\\\\"
+       | '\n' -> Buffer.add_string b "\\n"
+       | '\t' -> Buffer.add_string b "\\t"
+       | '\r' -> Buffer.add_string b "\\r"
+       | c -> Buffer.add_char b c)
+    s;
+  Buffer.add_char b '"';
+  Buffer.contents b
+
+let record_to_string (r : run) =
+  let buf = Buffer.create 512 in
+  let add fmt = Printf.ksprintf (Buffer.add_string buf) fmt in
+  let opt = function None -> "" | Some s -> s in
+  add "(run\n";
+  add " (box %s)\n" (quote r.box);
+  add " (run-id %s)\n" (quote r.run_id);
+  add " (job %s)\n" (quote r.job);
+  add " (occurrence %s)\n" (Printf.sprintf "%.6f" r.occurrence);
+  add " (started %s)\n" (Printf.sprintf "%.6f" r.started);
+  add " (finished %s)\n" (opt (Option.map (Printf.sprintf "%.6f") r.finished));
+  add " (exit %s)\n" (opt (Option.map string_of_int r.exit));
+  add " (signal %s)\n" (opt (Option.map string_of_int r.signal));
+  add " (verdict %s)\n" (quote (wire_verdict r.verdict));
+  add " (attempt %d)\n" r.attempt;
+  add " (log-tail %s)\n" (quote r.log_tail);
+  add " (evidence %s))\n" (quote r.evidence);
+  Buffer.contents buf
+
+let stored_atom ~file ~key = function
+  | [] -> ""
+  | [ Atom (v, _) ] -> v
+  | _ -> refuse file 1 "%s: expected at most one value in a stored record" key
+
+let record_of_sexp file : sexp -> run = function
+  | List (Atom ("run", _) :: forms, _) ->
+    let tbl = Hashtbl.create 17 in
+    List.iter
+      (fun form ->
+         match form with
+         | List (Atom (k, _) :: args, _) -> Hashtbl.replace tbl k args
+         | _ -> refuse file 1 "stored record: expected (key value), got a non-form")
+      forms;
+    let raw key =
+      match Hashtbl.find_opt tbl key with
+      | Some args -> stored_atom ~file ~key args
+      | None -> refuse file 1 "stored record: missing key %S" key
+    in
+    let req key =
+      match raw key with
+      | "" -> refuse file 1 "stored record: empty value for %S" key
+      | v -> v
+    in
+    let optf key conv =
+      match raw key with
+      | "" -> None
+      | v -> (
+        match conv v with
+        | Some x -> Some x
+        | None -> refuse file 1 "stored record: %s: bad value %S" key v)
+    in
+    let num key =
+      match optf key float_of_string_opt with
+      | Some x -> x
+      | None -> refuse file 1 "stored record: empty value for %S" key
+    in
+    let integer key =
+      match optf key int_of_string_opt with
+      | Some x -> x
+      | None -> refuse file 1 "stored record: empty value for %S" key
+    in
+    let verdict =
+      match req "verdict" with
+      | "ok" -> `Ok
+      | "timeout" -> `Timeout
+      | "missing" -> `Missing
+      | v when String.length v > 7 && String.sub v 0 7 = "failed:" ->
+        `Failed (String.sub v 7 (String.length v - 7))
+      | v -> refuse file 1 "stored record: unknown verdict %S" v
+    in
+    { box = req "box";
+      run_id = req "run-id";
+      job = req "job";
+      occurrence = num "occurrence";
+      started = num "started";
+      finished = optf "finished" float_of_string_opt;
+      exit = optf "exit" int_of_string_opt;
+      signal = optf "signal" int_of_string_opt;
+      verdict;
+      attempt = integer "attempt";
+      log_tail = raw "log-tail";
+      evidence = raw "evidence" }
+  | List (_, l) -> refuse file l "stored record: expected (run ...)"
+  | Atom (_, l) -> refuse file l "stored record: expected (run ...)"
+
+let record_path dir run_id = Filename.concat dir (run_id ^ record_suffix)
+
+(* A run_id arrives from the wire: a path separator would write outside
+   the store, so anything but a bare id is refused. *)
+let safe_run_id run_id =
+  let ok = ref (run_id <> "") in
+  String.iter (fun c -> if c = '/' || c = '\\' || c = '.' then ok := false) run_id;
+  !ok
+
+let record_matches_evidence (r : run) =
+  r.evidence <> "" && r.evidence = evidence_of_record r
+
+let write_record_file file (r : run) =
+  let tmp = file ^ ".tmp" in
+  let oc = open_out_bin tmp in
+  output_string oc (record_to_string r);
+  close_out oc;
+  Sys.rename tmp file
+
+let write_record dir (r : run) =
+  write_record_file (record_path dir r.run_id) r
+
+let read_record file : (run, string) result =
+  match read_file file with
+  | Error m -> Error (Printf.sprintf "%s:1: %s" file m)
+  | Ok src -> (
+    try
+      Ok
+        (match parse_sexp file src with
+         | [ one ] -> record_of_sexp file one
+         | _ ->
+           refuse file 1 "stored record: expected exactly one (run ...) form")
+    with Refused m -> Error m)
+
+(* Ingest is the only door into central's table: the evidence is checked
+   against the record as received, and a record that fails it is logged
+   and stores nothing. *)
+let ingest ?(log = fun m -> prerr_endline ("pp-cron: " ^ m)) dir (r : run) :
+    (unit, string) result =
+  if not (safe_run_id r.run_id) then begin
+    let m =
+      Printf.sprintf "REJECTED run %S: run_id is not a bare id (nothing stored)"
+        r.run_id
+    in
+    log m;
+    Error m
+  end
+  else if not (record_matches_evidence r) then begin
+    let m =
+      Printf.sprintf
+        "REJECTED run %s: evidence does not match the record's payload (nothing stored)"
+        r.run_id
+    in
+    log m;
+    Error m
+  end
+  else
+    match (try Ok (write_record dir r) with Sys_error e -> Error e) with
+    | Ok () -> Ok ()
+    | Error e ->
+      let m = Printf.sprintf "REJECTED run %s: %s (nothing stored)" r.run_id e in
+      log m;
+      Error m
+
+(* Verify recomputes the evidence over what is on disk. Untouched records
+   yield no complaints (exit 0); an altered record is named by run_id. *)
+let verify_store dir : string list =
+  match (try Ok (Sys.readdir dir) with Sys_error e -> Error e) with
+  | Error e -> [ Printf.sprintf "%s:1: %s" dir e ]
+  | Ok entries ->
+    let names =
+      Array.to_list entries
+      |> List.filter (fun n -> Filename.check_suffix n record_suffix)
+      |> List.sort compare
+    in
+    List.concat
+      (List.map
+         (fun name ->
+            let file = Filename.concat dir name in
+            match read_record file with
+            | Error m -> [ m ]
+            | Ok r ->
+              if record_matches_evidence r then []
+              else
+                [ Printf.sprintf
+                    "%s: run %s: evidence does not match the stored fields (record altered)"
+                    file r.run_id ])
+         names)

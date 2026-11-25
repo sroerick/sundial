@@ -389,12 +389,19 @@
         (sundial T1, commit d60c5040) and are retained as the contract to
         port, not as the target location.
 
-        Blocking before ingest can move: observability authenticates with
-        one shared bearer token, so subsection identity and acceptance A10
-        cannot hold there yet. Per-box tokens are a prerequisite, not a
-        follow-up. The fate of tuna's 0018 tables and endpoints is a tuna
-        owner decision. Cross-project map: docs/fleet.md (interim; to be
-        rewritten into ocotillo).
+        Identity: observability accepts per-box tokens (its README,
+        "Tokens"); a box token writes only its own box and a mismatch is
+        refused whole before any write. A box must be given its own
+        token, never the shared factory token. SPEC GAP, for the owner
+        of this book: observability refuses a mismatch with 403, while
+        subsection identity and acceptance A10 below say 400. Either
+        amend those to 403 or have the central return 400; until then
+        A10 is not met as written.
+
+        Still missing before ingest can move: a runs/jobs/heartbeat
+        surface in observability. The fate of tuna's 0018 tables and
+        endpoints is a tuna owner decision. Cross-project map:
+        docs/fleet.md (interim; to be rewritten into ocotillo).
 
         Previous decision, kept for provenance:
 

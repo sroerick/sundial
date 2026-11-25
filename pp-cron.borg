@@ -370,10 +370,34 @@
        |))))
 
  (section ingest
-  (doc "tuna owns the central record: its own table, its own endpoints, write-only")
+  (doc "The central record: its own table, its own endpoints, write-only")
   (status planned)
   (details
    (doc (|
+        OPERATOR DECISION (2026-11-24), SUPERSEDING THE ONE BELOW: the
+        central is the existing observability service on wyo.town, not
+        tuna. wyo.town is the infrastructure host and cactus runs
+        applications; observability is already an ingest-only HTTP to
+        Postgres service with the outbox contract this book wants, and
+        already receives factory telemetry. The single-central argument
+        below still holds; only the choice of central changed.
+
+        What carries over unchanged: the run record, UNIQUE (box, run_id)
+        with upsert, the write-only surface with no dispatch, per-box
+        identity with box confinement, and absence synthesis. The schema
+        and surface subsections below describe the tuna implementation
+        (sundial T1, commit d60c5040) and are retained as the contract to
+        port, not as the target location.
+
+        Blocking before ingest can move: observability authenticates with
+        one shared bearer token, so subsection identity and acceptance A10
+        cannot hold there yet. Per-box tokens are a prerequisite, not a
+        follow-up. The fate of tuna's 0018 tables and endpoints is a tuna
+        owner decision. Cross-project map: docs/fleet.md (interim; to be
+        rewritten into ocotillo).
+
+        Previous decision, kept for provenance:
+
         OPERATOR DECISION (2026-11-10): tuna is the only central. It is
         already OCaml/dune, already behind relayd with TLS on
         pricklypear.club, already has identities and bearer tokens, already

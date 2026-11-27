@@ -641,7 +641,8 @@
           install; the file carries no host.
        |)))
   (smoke "pp-cron check sundial/jobs accepts the declared factory-monitor and backup-agent-memory jobs")
-  (smoke "backup-conversations.sh drops an archive tar -tzf will not list and keeps a listed one at mode 0600 (saguaro/ops/test-backup.sh)"))
+  (smoke "backup-conversations.sh drops an archive tar -tzf will not list and keeps a listed one at mode 0600 (saguaro/ops/test-backup.sh)")
+  (smoke "factory-monitor labels log mentions, never executed checks (saguaro/ops/test-monitor.py)"))
 
  (section non-goals
   (doc "Refused in v1, with the seam where each could return")

@@ -623,6 +623,26 @@
         start on a newer schema than it knows.
        |))))
 
+ (section declared-jobs
+  (doc "The first two real jobs, kept in sundial/jobs/ and validated by pp-cron check")
+  (status planned)
+  (details
+   (doc (|
+        `pp-cron check sundial/jobs` validates these; the daemon that would
+        run them is not built, so the live schedule is still `al`'s crontab
+        on gregor and the laptop's systemd timers.
+
+        - `factory-monitor` runs on gregor every 15 minutes and calls
+          `/home/al/factory-monitor/monitor.sh`. The older supervisor probe
+          inside it is retired; see `saguaro/ops/RESCUE.md`.
+        - `backup-agent-memory` runs on the laptop (`chereb`, not a box in
+          the wyo-town universe) weekly and calls
+          `saguaro/ops/backup-conversations.sh`. Its `box` id is assigned at
+          install; the file carries no host.
+       |)))
+  (smoke "pp-cron check sundial/jobs accepts the declared factory-monitor and backup-agent-memory jobs")
+  (smoke "backup-conversations.sh drops an archive tar -tzf will not list and keeps a listed one at mode 0600 (saguaro/ops/test-backup.sh)"))
+
  (section non-goals
   (doc "Refused in v1, with the seam where each could return")
   (status planned)

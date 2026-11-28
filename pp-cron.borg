@@ -196,7 +196,7 @@
 
  (section scheduler
   (doc "A min-heap on a monotonic clock; the loop touches nothing but local time and SQLite")
-  (status planned)
+  (status implemented)
   (details
    (doc (|
         State: a min-heap of next fire times keyed on CLOCK_MONOTONIC -
@@ -225,7 +225,7 @@
 
  (section executor
   (doc "fork/exec in a fresh process group, deadline, group kill, log to a spool file")
-  (status planned)
+  (status implemented)
   (details
    (doc (|
         Spawn: fork, setpgid in the child, exec the argv directly (no
@@ -337,7 +337,7 @@
 
  (section heartbeat
   (doc "The dead-man switch: silence becomes a verdict")
-  (status planned)
+  (status implemented)
   (details
    (doc (|
         Two independent signals, because they fail independently.

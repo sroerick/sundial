@@ -21,6 +21,20 @@
  (name outbox)
  (modules outbox)
  (libraries spec))
+(library
+ (name sched)
+ (modules sched)
+ (libraries spec unix))
+
+(library
+ (name exec)
+ (modules exec)
+ (libraries spec policies unix))
+
+(library
+ (name heartbeat)
+ (modules heartbeat)
+ (libraries spec sched))
 
 (executable
  (name pp_cron)
@@ -30,7 +44,7 @@
 (test
  (name test_spec)
  (modules test_spec)
- (libraries spec policies envfile triage outbox unix)
+ (libraries spec policies envfile triage outbox sched exec heartbeat unix)
  (deps pp_cron.exe (glob_files jobs/*.sexp)))
 
 ; card a88d99 asks for the daemon-side binary to be named pp-cron.exe.

@@ -536,6 +536,186 @@ let () =
   check "outbox: pressure is silent at the threshold"
     (not (Outbox.backpressured ~pending:10_000 ()));
 
+  (* --- law (scheduler): heap order, occurrences in tz, replay, flock --- *)
+  let h = Sched.create () in
+  Sched.push h (30., "c");
+  Sched.push h (10., "a");
+  Sched.push h (20., "b");
+  check "scheduler: the heap peeks the earliest deadline" (Sched.peek h = Some (10., "a"));
+  check "scheduler: the heap pops in deadline order"
+    (Sched.pop h = Some (10., "a")
+    && Sched.pop h = Some (20., "b")
+    && Sched.pop h = Some (30., "c")
+    && Sched.pop h = None);
+  let daily = Spec.parse_cron ~file:"test" ~line:0 "17 3 * * *" in
+  let jan15 = 1_768_435_200. in
+  check "scheduler: an occurrence is computed on the declared clock"
+    (Sched.next_occurrence ~tz:"UTC" ~cron:daily ~after:jan15 () = Some 1_768_447_020.);
+  check "scheduler: the next occurrence is strictly after the last one"
+    (Sched.next_occurrence ~tz:"UTC" ~cron:daily ~after:1_768_447_020. ()
+    = Some 1_768_533_420.);
+  check "scheduler: a tz shifts the occurrence onto its wall clock"
+    (Sched.next_occurrence ~tz:"America/Denver" ~cron:daily ~after:jan15 ()
+    = Some 1_768_472_220.);
+  check "scheduler: the tz occurrence reads back as 03:17 local"
+    (let tm = Sched.local_tm "America/Denver" 1_768_472_220. in
+     tm.Unix.tm_hour = 3 && tm.Unix.tm_min = 17);
+  let dst_gap = Spec.parse_cron ~file:"test" ~line:0 "30 2 * * *" in
+  let mar8_midnight_mst = 1_772_953_200. in
+  check "scheduler: a local time skipped by DST does not fire that day"
+    (Sched.next_occurrence ~tz:"America/Denver" ~cron:dst_gap
+         ~after:mar8_midnight_mst ()
+    = Some 1_773_045_000.);
+  check "scheduler: the DST-gap job fires at 02:30 the next day"
+    (let tm = Sched.local_tm "America/Denver" 1_773_045_000. in
+     tm.Unix.tm_mday = 9 && tm.Unix.tm_hour = 2 && tm.Unix.tm_min = 30);
+  let quarter = Spec.parse_cron ~file:"test" ~line:0 "*/15 * * * *" in
+  let two_hours = Sched.replay ~tz:"UTC" ~cron:quarter ~last_fired:jan15
+      ~now:(jan15 +. 7200.) () in
+  check "scheduler: replay from the last fire gives every due occurrence"
+    (List.length two_hours = 8);
+  check "scheduler: replay occurrences match the schedule"
+    (List.hd two_hours = jan15 +. 900.
+    && List.nth two_hours 7 = jan15 +. 7200.);
+  check "scheduler: a clock step back does not storm"
+    (Sched.replay ~tz:"UTC" ~cron:quarter ~last_fired:jan15
+       ~now:(jan15 +. 600.) ()
+    = []);
+  check "scheduler: replay after the step resumes with no gap"
+    (Sched.replay ~tz:"UTC" ~cron:quarter ~last_fired:(jan15 +. 7200.)
+       ~now:(jan15 +. 14_400.) ()
+    = List.init 8 (fun i -> jan15 +. (900. *. float_of_int (i + 9))));
+  let lockdir = fresh "lock" in
+  let pidfile = Filename.concat lockdir "ppcron.pid" in
+  (match Sched.single_instance pidfile with
+   | `Acquired lock ->
+     check "scheduler: the first daemon takes the pidfile lock" true;
+     let child = Unix.fork () in
+      if child = 0 then begin
+        match Sched.single_instance pidfile with
+        | `Running -> Unix._exit 0
+        | `Acquired _ -> Unix._exit 3
+      end
+      else begin
+        let _, status = Unix.waitpid [] child in
+        check "scheduler: a second start exits instead of fighting for the heap"
+          (status = Unix.WEXITED 0)
+      end;
+     Sched.release lock;
+     check "scheduler: the lock is free after release"
+       (match Sched.single_instance pidfile with
+        | `Acquired l -> Sched.release l; true
+        | `Running -> false)
+   | `Running -> check "scheduler: the first daemon takes the pidfile lock" false);
+
+  (* --- law (executor): process group, deadline, spool, env contract --- *)
+  let spool = fresh "spool" in
+  let ok = Exec.run ~spool_dir:spool ~timeout:5. ~cmd:[ "/bin/sh"; "-c"; "echo hello" ] () in
+  check "executor: a clean exit is ok" (ok.Exec.verdict = `Ok && ok.Exec.exit = Some 0);
+  check "executor: the spool tail carries the output" (has_sub ok.Exec.log_tail "hello");
+  check "executor: the byte count is the true size" (ok.Exec.log_bytes = 6);
+  let failed = Exec.run ~spool_dir:spool ~timeout:5. ~cmd:[ "/bin/sh"; "-c"; "exit 4" ] () in
+  check "executor: a non-zero exit is a failure"
+    (failed.Exec.verdict = `Failed "exit 4");
+  let allowed =
+    Exec.run ~ok_codes:[ 4 ] ~spool_dir:spool ~timeout:5.
+      ~cmd:[ "/bin/sh"; "-c"; "exit 4" ] ()
+  in
+  check "executor: a declared ok-code is success" (allowed.Exec.verdict = `Ok);
+  let marker = Filename.concat spool "grandchild-alive" in
+  let script = Printf.sprintf "(sleep 1; echo alive > %s) & sleep 30" marker in
+  let t =
+    Exec.run ~grace:0.3 ~spool_dir:spool ~timeout:0.3
+      ~cmd:[ "/bin/sh"; "-c"; script ] ()
+  in
+  check "executor: the deadline verdict is timeout" (t.Exec.verdict = `Timeout);
+  check "executor: the timeout is recorded" t.Exec.timed_out;
+  Unix.sleepf 1.2;
+  check "executor: killing the process group ends the grandchild"
+    (not (Sys.file_exists marker));
+  let chatty =
+    Exec.run ~spool_dir:spool ~timeout:10.
+      ~cmd:[ "/bin/sh"; "-c"; "dd if=/dev/zero bs=1024 count=1024 2>/dev/null" ] ()
+  in
+  check "executor: a chatty job does not deadlock" (chatty.Exec.verdict = `Ok);
+  check "executor: log_bytes reports the true size" (chatty.Exec.log_bytes = 1_048_576);
+  check "executor: log_tail is the last 8 KiB"
+    (String.length chatty.Exec.log_tail = 8192);
+  let envjob =
+    let dir = fresh "jobs-execenv" in
+    write_file (Filename.concat dir "execenv.sexp")
+      {|(job "execenv"
+  (schedule "17 3 * * *")
+  (tz "UTC")
+  (cmd "/bin/true")
+  (timeout 60)
+  (heartbeat 93600))
+|};
+    match Spec.check_dir dir with
+    | Ok [ j ] -> j
+    | _ -> failwith "exec env job did not parse"
+  in
+  let es =
+    Spec.begin_run ~box:"gregor" ~job:"execenv" ~occurrence:1_700_000_000.
+      ~now:1_700_000_001. ()
+  in
+  let child_env =
+    Envfile.child_env
+      ~daemon:[| "PATH=/usr/bin:/bin"; "HOME=/nonexistent" |]
+      ~base:[ ("FOO", "bar") ] envjob es
+  in
+  let e =
+    Exec.run ~env:(Some child_env) ~spool_dir:spool ~timeout:5.
+      ~cmd:[ "/bin/sh"; "-c"; "printf '%s %s' \"$RUN_ID\" \"$FOO\"" ] ()
+  in
+  check "executor: the RUN_ID contract and env file reach the child"
+    (e.Exec.log_tail = es.Spec.run_id ^ " bar");
+
+  (* --- law (heartbeat): liveness and absence synthesis stay apart --- *)
+  let daily9 = Spec.parse_cron ~file:"test" ~line:0 "0 9 * * *" in
+  let exp =
+    [ { Heartbeat.job = "daily";
+        cron = daily9;
+        tz = "UTC";
+        heartbeat = 93_600. } ]
+  in
+  let beats from until =
+    let rec go t acc = if t > until then List.rev acc else go (t +. 60.) (t :: acc) in
+    go from []
+  in
+  let jan15_09 = 1_768_467_600. and jan16_09 = 1_768_554_000. in
+  let seen = [ ("daily", jan15_09) ] in
+  check "heartbeat: a late fire does not synthesize a missing row"
+    (Heartbeat.missing ~since:jan15 ~now:(jan15_09 +. (25. *. 3600.))
+       ~expectations:exp ~observed:seen
+       ~beats:(beats jan15 (jan15_09 +. (25. *. 3600.)))
+    = []);
+  check "heartbeat: the row appears only after the declared gap"
+    (Heartbeat.missing ~since:jan15 ~now:(jan15_09 +. (51. *. 3600.))
+       ~expectations:exp ~observed:seen
+       ~beats:(beats jan15 (jan15_09 +. (51. *. 3600.)))
+    = [ ("daily", jan16_09) ]);
+  check "heartbeat: a dead box yields no missing-run rows"
+    (Heartbeat.missing ~since:jan15 ~now:(jan15_09 +. (51. *. 3600.))
+       ~expectations:exp ~observed:seen ~beats:(beats jan15 jan15_09)
+    = []);
+  check "heartbeat: liveness is 3x the interval"
+    (Heartbeat.liveness ~last_beat:(Some 1_000.) ~now:1_179. = `Alive
+    && Heartbeat.liveness ~last_beat:(Some 1_000.) ~now:1_181. = `Gap);
+  check "heartbeat: no beat at all is a gap"
+    (Heartbeat.liveness ~last_beat:None ~now:1_000. = `Gap);
+  let beat =
+    { Heartbeat.box = "gregor";
+      ts = jan15_09;
+      uptime_s = 3600.;
+      jobs_loaded = 2;
+      pending_outbox = 5;
+      in_flight = 1 }
+  in
+  check "heartbeat: the payload names the box and its counts"
+    (has_sub (Heartbeat.payload beat) "\"box\":\"gregor\""
+    && has_sub (Heartbeat.payload beat) "\"pending_outbox\":5");
+
   if !failures = 0 then Printf.printf "pp-cron spec: %d checks, all laws hold\n" !checks
   else begin
     Printf.printf "pp-cron spec: %d failure(s)\n" !failures;

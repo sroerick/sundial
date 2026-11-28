@@ -4,8 +4,10 @@
    refused, and reload is fail-closed (previous set kept). *)
 
 let failures = ref 0
+let checks = ref 0
 
 let check name cond =
+  incr checks;
   if not cond then begin
     incr failures;
     Printf.printf "FAIL %s\n" name
@@ -17,6 +19,10 @@ let has_sub hay needle =
     i + nl <= hl && (String.sub hay i nl = needle || go (i + 1))
   in
   nl = 0 || go 0
+let refused_err name dir needle =
+  match Spec.check_dir dir with
+  | Ok _ -> check name false
+  | Error errs -> check name (List.exists (fun e -> has_sub e needle) errs)
 
 let write_file path content =
   let oc = open_out_bin path in
@@ -189,7 +195,156 @@ let () =
     (not (Sys.file_exists (Filename.concat store2 (record.Spec.run_id ^ ".run"))));
   check "an empty store verifies clean" (Spec.verify_store store2 = []);
 
-  if !failures = 0 then print_endline "pp-cron spec: all laws hold"
+  (* --- law (run-record): one record definition, field laws, wire round-trip --- *)
+  let rec_dir = fresh "jobs-record" in
+  write_file (Filename.concat rec_dir "rich.sexp")
+    {|(job "rich"
+  (schedule "*/5 0-6 * * 1-5")
+  (tz "America/Denver")
+  (cmd "/bin/echo" "hi")
+  (timeout 60)
+  (overlap kill 5)
+  (on-miss all)
+  (retry 3 30)
+  (heartbeat 3600)
+  (tags ("a" "b")))
+|};
+  (match Spec.check_dir rec_dir with
+   | Ok [ j ] ->
+     check "record: schedule is the cron expression"
+       (j.Spec.schedule = "*/5 0-6 * * 1-5");
+     check "record: tz is explicit" (j.Spec.tz = "America/Denver");
+     check "record: cmd is argv, not a shell line" (j.Spec.cmd = [ "/bin/echo"; "hi" ]);
+     check "record: timeout in seconds" (j.Spec.timeout = 60.);
+     check "record: overlap kill carries its grace" (j.Spec.overlap = `Kill 5.);
+     check "record: on-miss is a policy, not a bool" (j.Spec.on_miss = `All);
+     check "record: retry is attempts and delay" (j.Spec.retry = Some (3, 30.));
+     check "record: tags" (j.Spec.tags = [ "a"; "b" ]);
+     check "record: heartbeat declared" (j.Spec.heartbeat = 3600.)
+   | _ -> check "record: one file defines one job" false);
+  let occ = 1_700_000_000. in
+  let late = Spec.begin_run ~box:"gregor" ~job:"rich" ~occurrence:occ ~now:(occ +. 40.) () in
+  check "occurrence is the intended fire, not the actual start"
+    (late.Spec.occurrence = occ && late.Spec.started = occ +. 40.);
+  check "box is the stable id handed in, never a hostname" (late.Spec.box = "gregor");
+  let retry_start =
+    Spec.begin_run ~box:"gregor" ~job:"rich" ~occurrence:occ ~now:(occ +. 41.)
+      ~run_id:late.Spec.run_id ~attempt:2 ()
+  in
+  check "a retry keeps one run_id and changes only attempt"
+    (retry_start.Spec.run_id = late.Spec.run_id && retry_start.Spec.attempt = 2);
+  check "run_id is time-sortable"
+    (String.compare (Spec.mint_run_id ~now:1_600_000_000.)
+       (Spec.mint_run_id ~now:1_700_000_000.)
+    < 0);
+  let long = String.make 10_000 'x' ^ "TAIL" in
+  let rec_run =
+    Spec.finish_run ~start:late `Ok ~finished:(occ +. 43.) ~exit:0 ~log_tail:long ()
+  in
+  check "log_tail is bounded to 8 KiB" (String.length rec_run.Spec.log_tail = 8192);
+  check "log_tail keeps the end of the output" (has_sub rec_run.Spec.log_tail "TAIL");
+  let rt = fresh "record-roundtrip" in
+  Spec.write_record rt rec_run;
+  (match Spec.read_record (Filename.concat rt (rec_run.Spec.run_id ^ ".run")) with
+   | Error e -> check ("record round-trips through the wire form: " ^ e) false
+   | Ok back ->
+     check "record round-trips through the wire form" ((back : Spec.run) = rec_run));
+  check "evidence covers the verdict"
+    (not (Spec.record_matches_evidence { rec_run with Spec.verdict = `Failed "rewritten" }));
+  check "evidence covers the attempt"
+    (not (Spec.record_matches_evidence { rec_run with Spec.attempt = 9 }));
+
+  (* --- law (schedule-files): one job per file, unknown keys and values refused --- *)
+  let two = fresh "jobs-two-forms" in
+  write_file (Filename.concat two "two.sexp") (good_job ^ good_job);
+  refused_err "two (job ...) forms in one file are refused" two
+    "expected exactly one (job ...) form";
+  let unkkey = fresh "jobs-unknown-key" in
+  write_file (Filename.concat unkkey "unk.sexp")
+    {|(job "unk"
+  (schedule "17 3 * * *")
+  (tz "UTC")
+  (cmd "/bin/true")
+  (timeout 60)
+  (heartbeat 93600)
+  (retries 3))
+|};
+  refused_err "an unknown key is refused, never ignored" unkkey "unknown key";
+  let dupkey = fresh "jobs-duplicate-key" in
+  write_file (Filename.concat dupkey "dup.sexp")
+    {|(job "dup"
+  (schedule "17 3 * * *")
+  (schedule "18 3 * * *")
+  (tz "UTC")
+  (cmd "/bin/true")
+  (timeout 60)
+  (heartbeat 93600))
+|};
+  refused_err "a duplicate key is refused" dupkey "duplicate key";
+  let dupname = fresh "jobs-duplicate-name" in
+  write_file (Filename.concat dupname "a.sexp") good_job;
+  write_file (Filename.concat dupname "b.sexp") good_job;
+  refused_err "a duplicate job name across files is refused" dupname "duplicate job name";
+  let missing = fresh "jobs-missing-key" in
+  write_file (Filename.concat missing "missing.sexp")
+    {|(job "missing"
+  (schedule "17 3 * * *")
+  (tz "UTC")
+  (cmd "/bin/true")
+  (heartbeat 93600))
+|};
+  refused_err "a missing required key is refused" missing "missing required key";
+
+  (* --- law (declared-jobs): the two real jobs validate as declared --- *)
+  (match Spec.check_dir "jobs" with
+   | Ok jobs ->
+     let names = List.sort compare (List.map (fun (j : Spec.job) -> j.Spec.name) jobs) in
+     check "sundial/jobs declares factory-monitor and backup-agent-memory"
+       (names = [ "backup-agent-memory"; "factory-monitor" ]);
+     (match List.find_opt (fun (j : Spec.job) -> j.Spec.name = "factory-monitor") jobs with
+      | None -> check "factory-monitor is declared" false
+      | Some j ->
+        check "factory-monitor fires every fifteen minutes"
+          (j.Spec.schedule = "*/15 * * * *");
+        check "factory-monitor heartbeat covers its cadence" (j.Spec.heartbeat = 3600.));
+     (match List.find_opt (fun (j : Spec.job) -> j.Spec.name = "backup-agent-memory") jobs with
+      | None -> check "backup-agent-memory is declared" false
+      | Some j ->
+        check "backup-agent-memory is weekly, Monday 09:00"
+          (j.Spec.schedule = "0 9 * * 1");
+        check "backup-agent-memory carries an explicit tz, no host"
+          (j.Spec.tz = "America/Denver");
+        check "backup-agent-memory heartbeat covers a week" (j.Spec.heartbeat = 691200.))
+   | Error errs -> check ("sundial/jobs validates: " ^ String.concat "; " errs) false);
+
+  (* --- law (non-goals): refused surfaces stay refused --- *)
+  let ng = fresh "jobs-nongoal" in
+  write_file (Filename.concat ng "auto.sexp")
+    {|(job "auto"
+  (schedule "17 3 * * *")
+  (tz "UTC")
+  (cmd "/bin/true")
+  (timeout 60)
+  (heartbeat 93600)
+  (auto-disable true))
+|};
+  refused_err "auto-disable is refused as a policy" ng "unknown key";
+  let dag = fresh "jobs-dag" in
+  write_file (Filename.concat dag "dag.sexp")
+    {|(job "dag"
+  (schedule "17 3 * * *")
+  (tz "UTC")
+  (cmd "/bin/true")
+  (timeout 60)
+  (heartbeat 93600)
+  (depends-on "other"))
+|};
+  refused_err "cross-job dependencies are refused" dag "unknown key";
+  let quiet c = Sys.command (c ^ " >/dev/null 2>&1") in
+  check "there is no per-box web server" (quiet "./pp_cron.exe serve" = 2);
+  check "there is no command or dispatch surface" (quiet "./pp_cron.exe run" = 2);
+
+  if !failures = 0 then Printf.printf "pp-cron spec: %d checks, all laws hold\n" !checks
   else begin
     Printf.printf "pp-cron spec: %d failure(s)\n" !failures;
     exit 1

@@ -42,7 +42,7 @@
 
  (section run-record
   (doc "One record definition; the local schema, the wire JSON, and the tuna table are all derived from it")
-  (status planned)
+  (status implemented)
   (details
    (doc (|
         The record is the product. Everything else in this book exists to
@@ -102,7 +102,7 @@
 
  (section schedule-files
   (doc "One file per job on local disk; s-expressions; validated before the daemon will use them")
-  (status planned)
+ (status implemented)
   (details
    (doc (|
         /etc/pp-cron/jobs/<name>.sexp, one job per file, read at start
@@ -625,7 +625,7 @@
 
  (section declared-jobs
   (doc "The first two real jobs, kept in sundial/jobs/ and validated by pp-cron check")
-  (status planned)
+  (status implemented)
   (details
    (doc (|
         `pp-cron check sundial/jobs` validates these; the daemon that would
@@ -646,7 +646,7 @@
 
  (section non-goals
   (doc "Refused in v1, with the seam where each could return")
-  (status planned)
+  (status implemented)
   (details
    (doc (|
         Per-box web server. A loopback unix socket serving status is the

@@ -11,7 +11,8 @@
 (test
  (name test_spec)
  (modules test_spec)
- (libraries spec unix))
+ (libraries spec unix)
+ (deps pp_cron.exe (glob_files jobs/*.sexp)))
 
 ; card a88d99 asks for the daemon-side binary to be named pp-cron.exe.
 (rule

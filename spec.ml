@@ -145,9 +145,13 @@ let mint_run_id ~now =
   let st = Random.State.make [| seed; Random.bits () |] in
   ulid ~now (fun () -> Random.State.int st 32)
 
-(* Called BEFORE fork/exec: the id exists even if the daemon dies mid-run. *)
-let begin_run ~box ~job ~occurrence ~now ?(attempt = 1) () =
-  { box; run_id = mint_run_id ~now; job; occurrence; started = now; attempt }
+(* Called BEFORE fork/exec: the id exists even if the daemon dies mid-run.
+   A retry of one occurrence passes the first attempt's [run_id], so the
+   job's idempotency key is stable and only [attempt] changes. *)
+let begin_run ~box ~job ~occurrence ~now ?attempt ?run_id () =
+  let attempt = match attempt with Some a -> a | None -> 1 in
+  let run_id = match run_id with Some id -> id | None -> mint_run_id ~now in
+  { box; run_id; job; occurrence; started = now; attempt }
 
 (* Called at reap, with a box-side verdict. Same run_id across retries of
    one occurrence; only [attempt] differs. *)

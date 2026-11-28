@@ -2,6 +2,25 @@
  (name spec)
  (modules spec)
  (libraries unix))
+(library
+ (name policies)
+ (modules policies)
+ (libraries spec))
+
+(library
+ (name envfile)
+ (modules envfile)
+ (libraries spec unix))
+
+(library
+ (name triage)
+ (modules triage)
+ (libraries spec))
+
+(library
+ (name outbox)
+ (modules outbox)
+ (libraries spec))
 
 (executable
  (name pp_cron)
@@ -11,7 +30,7 @@
 (test
  (name test_spec)
  (modules test_spec)
- (libraries spec unix)
+ (libraries spec policies envfile triage outbox unix)
  (deps pp_cron.exe (glob_files jobs/*.sexp)))
 
 ; card a88d99 asks for the daemon-side binary to be named pp-cron.exe.

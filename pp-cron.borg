@@ -144,7 +144,7 @@
 
   (subsection policies
    (doc "overlap, on-miss, retry: the three things cron does not have and this tool exists for")
-   (status planned)
+   (status implemented)
    (details
     (doc (|
          overlap governs a firing whose predecessor is still running:
@@ -178,7 +178,7 @@
 
   (subsection env-and-secrets
    (doc "Per-job env from a local 0600 file; never from central")
-   (status planned)
+   (status implemented)
    (details
     (doc (|
          (env-from "/etc/pp-cron/env/acme-renew.env") is parsed as
@@ -309,7 +309,7 @@
 
  (section outbox
   (doc "A dumb batch shipper in its own failure domain; blind retries are safe by construction")
-  (status planned)
+  (status implemented)
   (details
    (doc (|
         Loop: take up to 200 pending rows oldest-first, POST, delete on
@@ -572,7 +572,7 @@
 
  (section triage
   (doc "Agent-first means the agent reads the record, never the scheduler")
-  (status planned)
+  (status implemented)
   (details
    (doc (|
         The boundary, stated as a hard line: no agent, model, or remote

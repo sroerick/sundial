@@ -32,6 +32,7 @@ type job = {
   overlap : overlap;
   on_miss : on_miss;
   retry : (int * float) option;   (* attempts, delay seconds *)
+  ok_codes : int list;            (* exit codes that mean success besides 0 *)
   heartbeat : float;              (* expected max gap, seconds *)
   tags : string list;
 }
@@ -401,6 +402,7 @@ let parse_job ~file (s : sexp) : job =
   let sched = ref None and tz = ref None and cmd = ref None and env = ref None in
   let timeout = ref None and overlap = ref None and on_miss = ref None in
   let retry = ref None and heartbeat = ref None and tags = ref [] in
+  let ok_codes = ref [] in
   let hb_line = ref job_line in
   List.iter
     (fun form ->
@@ -459,7 +461,20 @@ let parse_job ~file (s : sexp) : job =
                 | _ -> refuse file al "retry: delay must be >= 0 seconds"
               in
               retry := Some (attempts, delay)
-            | _ -> refuse file kl "retry: expected attempts and delay seconds")
+              | _ -> refuse file kl "retry: expected attempts and delay seconds")
+            | "ok-codes" -> (
+              match args with
+              | [ List (items, _) ] ->
+                ok_codes :=
+                  List.map
+                    (fun item ->
+                      let v = atom_of ~file item in
+                      match int_of_string_opt v with
+                      | Some n -> n
+                      | None ->
+                        refuse file (line_of item) "ok-codes: expected integers, got %S" v)
+                    items
+              | _ -> refuse file kl "ok-codes: expected a list of exit codes")
           | "heartbeat" ->
             let v = num () in
             hb_line := kl;
@@ -503,6 +518,7 @@ let parse_job ~file (s : sexp) : job =
     overlap = (match !overlap with Some o -> o | None -> `Skip);
     on_miss = (match !on_miss with Some m -> m | None -> `Skip);
     retry = !retry;
+      ok_codes = !ok_codes;
     heartbeat;
     tags = !tags }
 

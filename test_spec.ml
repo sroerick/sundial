@@ -344,6 +344,198 @@ let () =
   check "there is no per-box web server" (quiet "./pp_cron.exe serve" = 2);
   check "there is no command or dispatch surface" (quiet "./pp_cron.exe run" = 2);
 
+  (* --- law (policies): overlap, catch-up, retry and ok-codes --- *)
+  check "overlap: a free slot dispatches" (Policies.overlap_action `Skip `Done = `Dispatch);
+  check "overlap: skip records the firing instead of running it"
+    (Policies.overlap_action `Skip (`Running 5.) = `Skip_recorded);
+  check "overlap: queue serializes one deep"
+    (Policies.overlap_action `Queue (`Running 5.) = `Queue);
+  check "overlap: kill names its grace"
+    (Policies.overlap_action (`Kill 30.) (`Running 5.) = `Kill_after 30.);
+  check "a skipped firing is recorded, not dropped"
+    (Policies.skipped_verdict = `Failed "overlap-skip");
+  check "a policy-killed firing is recorded as such"
+    (Policies.killed_verdict = `Failed "overlap-kill");
+  let missed = [ 1.; 2.; 3.; 4. ] in
+  check "on-miss skip runs nothing late" (Policies.catch_up `Skip ~missed = []);
+  check "on-miss once runs the latest missed occurrence"
+    (Policies.catch_up `Once ~missed = [ 4. ]);
+  check "on-miss all replays every missed occurrence"
+    (Policies.catch_up `All ~missed = missed);
+  check "retry: attempt 1 of 2 has one retry left"
+    (Policies.retry_action ~retry:(Some (2, 300.)) ~attempt:1 = `Retry_after 300.);
+  check "retry: the last allowed attempt is final"
+    (Policies.retry_action ~retry:(Some (2, 300.)) ~attempt:2 = `Final);
+  check "retry: no retry declared means final"
+    (Policies.retry_action ~retry:None ~attempt:1 = `Final);
+  check "retry only covers failure, never success"
+    (Policies.after_verdict ~retry:(Some (2, 300.)) ~attempt:1 `Ok = `Final);
+  check "retry covers a timeout"
+    (Policies.after_verdict ~retry:(Some (2, 300.)) ~attempt:1 `Timeout
+    = `Retry_after 300.);
+  check "exit 0 is success" (Policies.verdict_of_exit ~ok_codes:[] 0 = `Ok);
+  check "a non-zero exit is a failure"
+    (Policies.verdict_of_exit ~ok_codes:[] 3 = `Failed "exit 3");
+  check "a declared ok-code is success"
+    (Policies.verdict_of_exit ~ok_codes:[ 2; 3 ] 3 = `Ok);
+  let okc = fresh "jobs-okcodes" in
+  write_file (Filename.concat okc "ok.sexp")
+    {|(job "okc"
+  (schedule "17 3 * * *")
+  (tz "UTC")
+  (cmd "/bin/true")
+  (timeout 60)
+  (ok-codes (0 2))
+  (heartbeat 93600))
+|};
+  (match Spec.check_dir okc with
+   | Ok [ j ] -> check "record: ok-codes is a declared list" (j.Spec.ok_codes = [ 0; 2 ])
+   | _ -> check "record: ok-codes is a declared list" false);
+
+  (* --- law (env-and-secrets): KEY=VALUE, no expansion, minimal inheritance --- *)
+  (match Envfile.parse ~file:"t.env" "A=1\nB=two=2\n# c\n\nC=$HOME\n" with
+   | Ok [ ("A", "1"); ("B", "two=2"); ("C", "$HOME") ] ->
+     check "env: KEY=VALUE, no expansion, comments skipped" true
+   | Ok _ -> check "env: KEY=VALUE, no expansion, comments skipped" false
+   | Error e -> check ("env: " ^ e) false);
+  (match Envfile.parse ~file:"bad.env" "NOEQUALS\n" with
+   | Error e ->
+     check "env: a line without '=' is refused naming file:line"
+       (has_sub e "bad.env:1:")
+   | Ok _ -> check "env: a line without '=' is refused naming file:line" false);
+  (match Envfile.parse ~file:"bad.env" "1A=1\n" with
+   | Error _ -> check "env: a non-KEY left side is refused" true
+   | Ok _ -> check "env: a non-KEY left side is refused" false);
+  let envdir = fresh "jobs-envtest" in
+  write_file (Filename.concat envdir "envtest.sexp")
+    {|(job "envtest"
+  (schedule "17 3 * * *")
+  (tz "America/Denver")
+  (cmd "/bin/true")
+  (timeout 60)
+  (heartbeat 93600))
+|};
+  (match Spec.check_dir envdir with
+   | Ok [ j ] ->
+     let s =
+       Spec.begin_run ~box:"gregor" ~job:"envtest" ~occurrence:1_700_000_000.
+         ~now:1_700_000_001. ()
+     in
+     let base =
+       [ ("FOO", "bar"); ("TZ", "evil"); ("RUN_ID", "evil"); ("PATH", "/opt/bin") ]
+     in
+     let env =
+       Envfile.child_env
+         ~daemon:[| "PATH=/usr/bin:/bin"; "HOME=/home/_ppcron"; "TERM=xterm" |]
+         ~base j s
+     in
+     let get k = List.assoc_opt k env in
+     check "env: TZ is the job's declared tz" (get "TZ" = Some "America/Denver");
+     check "env: RUN_ID is the minted id, not the file's"
+       (get "RUN_ID" = Some s.Spec.run_id);
+     check "env: PP_CRON_OCCURRENCE is the intended fire"
+       (get "PP_CRON_OCCURRENCE" = Some "1700000000");
+     check "env: PP_CRON_ATTEMPT is 1-based" (get "PP_CRON_ATTEMPT" = Some "1");
+     check "env: PP_CRON_BOX is the stable box id" (get "PP_CRON_BOX" = Some "gregor");
+     check "env: the job file's variables are passed" (get "FOO" = Some "bar");
+     check "env: a file's PATH overrides the inherited one"
+       (get "PATH" = Some "/opt/bin");
+     check "env: no TERM leaks from the daemon" (get "TERM" = None);
+     check "env: no duplicate keys"
+       (List.length env
+       = List.length (List.sort_uniq compare (List.map fst env)))
+   | _ -> check "env: a job parses for the env test" false);
+
+  (* --- law (triage): one openness per (box, job, failure_class) window --- *)
+  let failed_run ?(job = "poison") ?(started = 1_700_000_000.) reason =
+    let s = Spec.begin_run ~box:"gregor" ~job ~occurrence:started ~now:started () in
+    Spec.finish_run ~start:s (`Failed reason) ~finished:(started +. 1.) ~exit:1 ()
+  in
+  let open_ = ref [] and opened = ref 0 in
+  List.iter
+    (fun i ->
+      let r = failed_run ~started:(1_700_000_000. +. (float_of_int i *. 60.)) "exit 1" in
+      match Triage.decide ~window:86400. ~open_:!open_ r with
+      | `Open cls ->
+        incr opened;
+        open_ :=
+          { Triage.box = r.Spec.box;
+            job = r.Spec.job;
+            failure_class = cls;
+            opened_at = r.Spec.started }
+          :: !open_
+      | `Annotate _ | `Ignore -> ())
+    (List.init 399 (fun i -> i));
+  check "triage: 399 failures of one class open one card" (!opened = 1);
+  let inside = failed_run ~started:(1_700_000_000. +. (399. *. 60.)) "exit 1" in
+  check "triage: a failure inside the window annotates the open card"
+    (match Triage.decide ~window:86400. ~open_:!open_ inside with
+     | `Annotate _ -> true
+     | _ -> false);
+  let after_window = failed_run ~started:(1_700_000_000. +. 90_000.) "exit 1" in
+  check "triage: a failure after the window opens a new card"
+    (match Triage.decide ~window:86400. ~open_:!open_ after_window with
+     | `Open _ -> true
+     | _ -> false);
+  let other_class = failed_run ~started:(1_700_000_100.) "timeout" in
+  check "triage: a different failure class opens its own card"
+    (match Triage.decide ~window:86400. ~open_:!open_ other_class with
+     | `Open _ -> true
+     | _ -> false);
+  let ok_run =
+    Spec.finish_run
+      ~start:(Spec.begin_run ~box:"gregor" ~job:"poison" ~occurrence:1. ~now:1. ())
+      `Ok ~finished:2. ()
+  in
+  check "triage: an ok run opens nothing"
+    (Triage.decide ~open_:[] ok_run = `Ignore);
+
+  (* --- law (outbox): batch, backoff, dead-letter, backpressure --- *)
+  let mkrow i =
+    { Outbox.run_id = Printf.sprintf "r%03d" i;
+      payload = "{}";
+      created_at = float_of_int i;
+      attempts = 0 }
+  in
+  let rows = List.init 250 mkrow in
+  let b = Outbox.batch rows in
+  check "outbox: a batch is capped at 200 rows" (List.length b = 200);
+  check "outbox: a batch takes the oldest rows first"
+    (List.map (fun r -> int_of_float r.Outbox.created_at) b
+    = List.init 200 (fun i -> i));
+  check "outbox: the rest stay pending" (List.length rows - List.length b = 50);
+  check "outbox: backoff doubles from one second"
+    (List.map Outbox.base_delay [ 1; 2; 3; 4 ] = [ 1.; 2.; 4.; 8. ]);
+  check "outbox: backoff stops at the five-minute ceiling"
+    (Outbox.base_delay 20 = 300.);
+  check "outbox: jitter never passes the ceiling"
+    (Outbox.backoff ~rand:(fun () -> 0.999) ~attempts:20 <= 300.
+    && Outbox.backoff ~rand:(fun () -> 0.) ~attempts:1 = 0.5);
+  let row = mkrow 7 in
+  check "outbox: a 2xx deletes the row"
+    (Outbox.decide ~rand:(fun () -> 0.5) row `Ok = `Delete);
+  check "outbox: a 5xx retries with backoff"
+    (match Outbox.decide ~rand:(fun () -> 0.5) row (`Server_error 503) with
+     | `Retry_after d -> d > 0. && d <= 300.
+     | _ -> false);
+  check "outbox: a transport error retries"
+    (match Outbox.decide ~rand:(fun () -> 0.5) row (`Transport "eof") with
+     | `Retry_after _ -> true
+     | _ -> false);
+  check "outbox: a 4xx is retried, not dropped"
+    (match Outbox.decide ~rand:(fun () -> 0.5) row (`Client_error 400) with
+     | `Retry_after _ -> true
+     | _ -> false);
+  let twice = { row with Outbox.attempts = 2 } in
+  check "outbox: a 4xx that repeats three times is dead-lettered"
+    (match Outbox.decide ~rand:(fun () -> 0.5) twice (`Client_error 400) with
+     | `Dead_letter msg -> has_sub msg "400"
+     | _ -> false);
+  check "outbox: pressure is announced above the threshold"
+    (Outbox.backpressured ~pending:10_001 ());
+  check "outbox: pressure is silent at the threshold"
+    (not (Outbox.backpressured ~pending:10_000 ()));
+
   if !failures = 0 then Printf.printf "pp-cron spec: %d checks, all laws hold\n" !checks
   else begin
     Printf.printf "pp-cron spec: %d failure(s)\n" !failures;
